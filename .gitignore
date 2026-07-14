@@ -1,0 +1,19 @@
+# Large regenerable synthetic datasets (produced by gen_synth*.py)
+*.jsonl
+
+# Trained generator checkpoint (produced by train_stage2.py)
+stage2.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,4 @@
+# Core runtime. The DSL itself comes from the external arc-dsl repo (see SETUP.md).
+torch>=2.0
+# arc-dsl (https://github.com/michaelhodel/arc-dsl) — clone separately, it is pure-Python
+# and has no pip package; make it importable per SETUP.md.
