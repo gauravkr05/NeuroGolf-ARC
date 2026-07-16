@@ -1,29 +1,64 @@
 # NeuroGolf — ARC Hackathon
 
-A three-stage neuro-symbolic solver for the **Abstraction and Reasoning Corpus (ARC)**.
-The core idea ("program golf"): every task is solved by a short program written in a
-grid DSL, and each stage learns to find that program faster than brute-force search.
+A three-stage system that learns to solve ARC-style grid puzzles by writing small programs. A CNN guesses which operations a task needs, a search engine assembles them into programs, a transformer learns to write whole programs directly, and a test-time training experiment checks whether the model can adapt to tasks it fails on.
 
-```
-Stage 1  Neural-guided enumeration   CNN ranks DSL primitives -> depth-limited search
-Stage 2  Program-generating transformer   CNN task-encoder -> decoder emits the program
-Stage 3  Solvers   Test-time training (TTT) + a hybrid (generator + enumerator) solver
-```
+## The idea
 
-## Pipeline in one paragraph
+An ARC task shows you a few input/output grid pairs and asks: what's the transformation? Instead of predicting the output grid pixel by pixel, everything here works in **program space**: solutions are short programs over a 62-operation DSL (mirrors, rotations, color swaps, grid concatenations, neighbor painting, and so on). A program is correct if executing it on every demo input reproduces every demo output — so correctness is checked by running code, not by a loss function.
 
-Starting from a DSL of grid operations, **Stage 1** generates synthetic
-`(input, output, program)` triples by applying random programs to random grids, trains a
-small CNN to predict *which primitives a task needs*, and uses that ranking to restrict a
-depth-limited enumerative search to the top-k operations (the "top 5 / top 8" cutoff).
-**Stage 2** replaces enumeration with a transformer that reads the task's train pairs and
-directly emits a program token-by-token (op, digit args, …, `<eos>`), verified by execution.
-**Stage 3** adds *test-time training*: for each unsolved task it samples programs, turns the
-failures into hindsight labels, fine-tunes a copy of the generator on them, and resamples —
-plus a **hybrid** solver that runs the fast generator first and falls back to the exact
-enumerator.
+That also solves the "no labels" problem. There's no dataset of (task → program) pairs in the wild, so one gets generated: sample a random valid program, run it on real grids, and the (pairs, program) result is a perfectly labeled training example. ~23k of these, quota-balanced so no operation is rare enough to be unlearnable.
 
-## Repository layout
+## The three stages
+
+**1. Primitive predictor + guided search** (`stage1_neural_guided_search/`)
+A small CNN (~92k params) reads the demo pairs (one-hot encoded, 12×12 canvas) and outputs a probability for each of the 62 operations — "this task smells like `vmirror` and `hconcat`". A DFS enumerator then searches programs using only the top-ranked ops first, widening if nothing verifies. DeepCoder-style: the network doesn't solve the task, it shrinks the haystack.
+
+* Multi-label BCE, Adam `1e-3`, 60 epochs, batch 64, uint8-cached tensors
+* Search: tiered depth (deep on top-3 ops, shallow as the beam widens), argument filtering, prefix memoization, 8k program budget
+
+**2. Program transformer** (`stage2_program_transformer/`)
+The same CNN encodes the task into a prefix token; a causal transformer decoder (~700k params) then writes the program token by token (`vconcat_hmirror_b <eos>`). Evaluated by sample-and-verify: draw 256 programs, execute each, first full match wins.
+
+* Cross-entropy with teacher forcing, Adam `3e-4`, 150 epochs, batch 48
+* Loss lands around 1.6 — part of it is irreducible (argument digits in synthetic programs are partly random)
+
+**3. Solvers** (`stage3_solvers/`)
+`hybrid_solver.py` runs the generator first (cheap, unbounded program depth) and falls back to guided search. `ttt_solver.py` is the test-time training experiment: on tasks the generator fails, every failed-but-valid sample is relabeled as a correct program *for the task it actually computes* (hindsight relabeling), the model is fine-tuned per-task on those, and resampled — against a control that gets the same total sample budget with no adaptation.
+
+## Benchmark
+
+39 real ARC tasks, built by **search-labeling**: run the full vocabulary against the ARC training set, keep every task where a verified program exists, and use that program's operations as the labels. Originally 50, pruned to 39 after re-verifying each program on hundreds of generated examples — 11 turned out to be lookalike rules that fit the demo pairs but not the task. About half the surviving tasks need 2 operations.
+
+## Results
+
+| | solved | median programs tried |
+|---|---|---|
+| Guided search | **31/39** | **2** |
+| Unguided search (control) | 17/39 | 4,445 |
+| Transformer alone | 12/39 | 5 |
+| Hybrid | 32/39 | — |
+| TTT vs matched-budget control | 4 vs 4 | — |
+
+The headline is the first two rows: with the CNN ranking operations, half the solved tasks fall on the *second* program tried, roughly 2,000× fewer executions than blind search — and the gap grows with vocabulary size, since blind search dies combinatorially while guided search barely notices. The transformer is the opposite personality: low coverage, but when its distribution contains the right program it finds it almost instantly; its failures are usually one wrong argument digit. TTT genuinely rescued 2 tasks the base model couldn't sample (correct ops, wrong combination → adaptation sharpened it), but resampling luck rescued 2 others, so at this scale the adaptation effect is about the size of the noise. Honest verdict: search+guidance is the workhorse, the generator is a promising sketch that needs cross-attention and more compute, and TTT needs augmentation and a stronger base model to shine.
+
+Stage 1 shown here is the final of several iterations (20 → 42 → 62 ops); earlier versions mostly exist as lessons about data bugs — starved classes, label ambiguity, and one self-inflicted spurious correlation.
+
+## Running it
+
+Everything is plain Python scripts, happiest on a GPU (Kaggle T4 works).
+
+1. Get the ARC task JSONs and [michaelhodel/arc-dsl](https://github.com/michaelhodel/arc-dsl) (the DSL the ops are built from); point the paths at them.
+2. Stage 1: `python gen_synth4.py` → `python train_stage1_cnn.py` → `python enumerate_v2.py`
+3. Stage 2: `python train_stage2.py` → `python eval_stage2.py`
+4. Stage 3: `python hybrid_solver.py` → `python ttt_solver.py`
+
+Training saves checkpoints (`stage1_cnn.pt`, `stage2.pt`); evaluation scripts print solved counts, medians, and per-task tables.
+
+## Requirements
+
+`torch`, `numpy`. That's it — the DSL and verifier are pure Python.
+
+## Files
 
 ```
 stages/
@@ -40,55 +75,3 @@ stages/
     ├── hybrid_solver.py     generator-first, enumerator-fallback
     └── train_stage2.py, vocab.py, enumerate_v2.py, prims.json, bench.json, stage1_cnn.pt
 ```
-
-Stage 1 is the 62-op final iteration; Stages 2 and 3 build on its `vocab.py` and data.
-
-## ⚠️ External dependencies you must supply (not in this repo)
-
-The original code was run in a container with two things checked out under `/home/claude`.
-They are **not redistributed here** and the code references them by absolute path:
-
-1. **`arc-dsl`** — the grid DSL (`dsl.py`) by Michael Hodel.
-   `vocab.py` / `gen_synth*.py` do `sys.path.insert(0, "/home/claude/arc-dsl"); import dsl`.
-   Get it: https://github.com/michaelhodel/arc-dsl and either clone it to that path or edit
-   the `sys.path.insert(...)` line to point at your checkout.
-
-2. **`compdata/`** — the ARC task JSON files, read as `/home/claude/compdata/task{NUM}.json`.
-   Supply the ARC-AGI tasks (or the hackathon task set) at that path, or edit the paths.
-
-See [`SETUP.md`](SETUP.md) for the exact lines to change.
-
-## Quick start
-
-```bash
-pip install -r requirements.txt
-# 1. make arc-dsl importable (see SETUP.md), and put ARC tasks in compdata/
-
-# Stage 1
-cd stages/stage1_neural_guided_search
-python gen_synth4.py          # regenerate synth_train/val.jsonl
-python train_stage1_cnn.py    # trains stage1_cnn.pt
-python enumerate_v2.py        # guided enumerative search
-
-# Stage 2
-cd ../../stage2_program_transformer
-python train_stage2.py        # produces stage2.pt
-python eval_stage2.py
-
-# Stage 3 (needs stage2.pt from Stage 2)
-cd ../stage3_solvers
-python ttt_solver.py
-python hybrid_solver.py
-```
-
-## Notes on files that are intentionally not committed
-
-* `*.jsonl` (the synthetic datasets, ~44 MB) are git-ignored — they are regenerated by the
-  `gen_synth*.py` scripts. They still exist locally after you run those scripts.
-* `stage2.pt` (the trained generator) is git-ignored — it is produced by `train_stage2.py`.
-* The small `stage1_cnn.pt` weights **are** committed so Stage 1 / hybrid work out of the box.
-
-A few small files (`vocab.py`, `prims.json`, `bench.json`, `train_stage2.py`, `enumerate_v2.py`)
-are duplicated into the stages that import them so each stage folder is self-contained and
-runnable on its own. If you prefer a single source of truth, move them into a shared
-`common/` package and adjust the `from vocab import …` imports accordingly.
