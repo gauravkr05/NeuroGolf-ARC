@@ -1,4 +1,4 @@
-# NeuroGolf — ARC Hackathon
+# NeuroGolf ARC Hackathon
 
 A three stage system that learns to solve ARC style grid puzzles by writing small programs. A CNN guesses which operations a task needs, a search engine assembles them into programs, a transformer learns to write whole programs directly, and a test time training experiment checks whether the model can adapt to tasks it fails on.
 
